@@ -1,0 +1,71 @@
+# Composite action: Setup Python with UV package manager
+# Fast, cached Python environment setup using Astral's UV
+name: Setup Python with UV
+description: Install UV, cache dependencies, and sync project
+
+inputs:
+  python-version:
+    description: 'Python version to install'
+    required: false
+    default: '3.12'
+  working-directory:
+    description: 'Directory containing pyproject.toml'
+    required: false
+    default: '.'
+  extras:
+    description: 'Extra dependency groups to install (comma-separated)'
+    required: false
+    default: ''
+  dev:
+    description: 'Install dev dependencies'
+    required: false
+    default: 'true'
+
+outputs:
+  python-path:
+    description: 'Path to Python executable'
+    value: ${{ steps.setup.outputs.python-path }}
+  cache-hit:
+    description: 'Whether cache was hit'
+    value: ${{ steps.setup-uv.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install UV
+      id: setup-uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+        cache-dependency-glob: |
+          ${{ inputs.working-directory }}/uv.lock
+          ${{ inputs.working-directory }}/pyproject.toml
+
+    - name: Set up Python
+      id: setup
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        uv python install ${{ inputs.python-version }}
+        echo "python-path=$(uv python find)" >> "$GITHUB_OUTPUT"
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        SYNC_ARGS=""
+        
+        # Add dev dependencies if requested
+        if [ "${{ inputs.dev }}" = "true" ]; then
+          SYNC_ARGS="$SYNC_ARGS --dev"
+        fi
+        
+        # Add extras if specified
+        if [ -n "${{ inputs.extras }}" ]; then
+          IFS=',' read -ra EXTRAS <<< "${{ inputs.extras }}"
+          for extra in "${EXTRAS[@]}"; do
+            SYNC_ARGS="$SYNC_ARGS --extra $(echo $extra | xargs)"
+          done
+        fi
+        
+        uv sync $SYNC_ARGS

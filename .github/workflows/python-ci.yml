@@ -1,0 +1,159 @@
+# Reusable workflow: Python CI with UV
+# Provides linting, type-checking, testing, and security scanning
+name: Python CI
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: 'JSON array of Python versions to test'
+        type: string
+        default: '["3.12"]'
+      working-directory:
+        description: 'Directory containing the Python project'
+        type: string
+        default: '.'
+      run-lint:
+        description: 'Run Ruff linter'
+        type: boolean
+        default: true
+      run-typecheck:
+        description: 'Run type checking with Pyright'
+        type: boolean
+        default: true
+      run-tests:
+        description: 'Run pytest'
+        type: boolean
+        default: true
+      run-security:
+        description: 'Run Bandit security scanner'
+        type: boolean
+        default: true
+      test-command:
+        description: 'Custom test command (default: pytest)'
+        type: string
+        default: 'pytest --cov --cov-report=xml'
+      coverage-threshold:
+        description: 'Minimum coverage percentage (0 to disable)'
+        type: number
+        default: 0
+      extras:
+        description: 'Extra dependency groups to install'
+        type: string
+        default: ''
+
+jobs:
+  lint:
+    if: ${{ inputs.run-lint }}
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python with UV
+        uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: '3.12'
+          working-directory: ${{ inputs.working-directory }}
+          extras: ${{ inputs.extras }}
+
+      - name: Run Ruff linter
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          uv run ruff check . --output-format=github
+
+      - name: Run Ruff formatter check
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          uv run ruff format . --check --diff
+
+  typecheck:
+    if: ${{ inputs.run-typecheck }}
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python with UV
+        uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: '3.12'
+          working-directory: ${{ inputs.working-directory }}
+          extras: ${{ inputs.extras }}
+
+      - name: Run Pyright
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          uv run pyright
+
+  test:
+    if: ${{ inputs.run-tests }}
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(inputs.python-versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python with UV
+        uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: ${{ matrix.python-version }}
+          working-directory: ${{ inputs.working-directory }}
+          extras: ${{ inputs.extras }}
+
+      - name: Run tests
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          uv run ${{ inputs.test-command }}
+
+      - name: Check coverage threshold
+        if: ${{ inputs.coverage-threshold > 0 }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          COVERAGE=$(uv run coverage report --format=total 2>/dev/null || echo "0")
+          if [ "$COVERAGE" -lt "${{ inputs.coverage-threshold }}" ]; then
+            echo "::error::Coverage ${COVERAGE}% is below threshold ${{ inputs.coverage-threshold }}%"
+            exit 1
+          fi
+          echo "Coverage: ${COVERAGE}% (threshold: ${{ inputs.coverage-threshold }}%)"
+
+      - name: Upload coverage
+        if: ${{ matrix.python-version == '3.12' }}
+        uses: codecov/codecov-action@v4
+        with:
+          file: ${{ inputs.working-directory }}/coverage.xml
+          fail_ci_if_error: false
+        continue-on-error: true
+
+  security:
+    if: ${{ inputs.run-security }}
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python with UV
+        uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: '3.12'
+          working-directory: ${{ inputs.working-directory }}
+          dev: 'true'
+
+      - name: Run Bandit security scanner
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          uv run bandit -r . -x ./tests -f sarif -o bandit-results.sarif || true
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ inputs.working-directory }}/bandit-results.sarif
+        continue-on-error: true
+
+      - name: Check for high-severity issues
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          uv run bandit -r . -x ./tests -ll -f txt
