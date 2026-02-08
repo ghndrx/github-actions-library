@@ -10,6 +10,7 @@ Reusable GitHub Actions workflows and composite actions for CI/CD pipelines.
 | Workflow | Description |
 |----------|-------------|
 | [`python-ci.yml`](.github/workflows/python-ci.yml) | Python CI with UV (lint, type-check, test, security) |
+| [`docker-ci.yml`](.github/workflows/docker-ci.yml) | Docker CI/CD with OIDC, attestations, and security scanning |
 
 ## Composite Actions
 
@@ -105,6 +106,80 @@ target-version = "py311"
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 ```
+
+## Docker CI Workflow Features
+
+The `docker-ci.yml` reusable workflow provides production-ready container builds:
+
+- **OIDC authentication** - Keyless auth to GHCR (no secrets needed)
+- **Multi-platform builds** - linux/amd64 + linux/arm64 by default
+- **SBOM generation** - Software Bill of Materials attestation
+- **Build provenance** - Cryptographic proof of build origin
+- **Trivy scanning** - Vulnerability detection with SARIF upload
+- **Smart caching** - GitHub Actions cache for layer reuse
+- **Semantic tagging** - Auto-tags from git refs and versions
+
+### Quick Start
+
+```yaml
+# .github/workflows/docker.yml
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    uses: ghndrx/github-actions-library/.github/workflows/docker-ci.yml@main
+    with:
+      image-name: my-app
+      push: ${{ github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+```
+
+### Inputs
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `image-name` | string | *required* | Image name (without registry) |
+| `context` | string | `.` | Docker build context path |
+| `dockerfile` | string | `Dockerfile` | Dockerfile path relative to context |
+| `push` | boolean | `false` | Push image to GHCR |
+| `platforms` | string | `linux/amd64,linux/arm64` | Target platforms |
+| `build-args` | string | `''` | Build args (newline-separated) |
+| `target` | string | `''` | Multi-stage build target |
+| `scan-severity` | string | `CRITICAL,HIGH` | Trivy severity threshold |
+| `fail-on-vuln` | boolean | `false` | Fail on vulnerabilities |
+| `generate-sbom` | boolean | `true` | Generate SBOM attestation |
+| `generate-provenance` | boolean | `true` | Generate provenance attestation |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `image-digest` | Image digest (sha256:...) |
+| `image-tags` | Generated tags (JSON array) |
+| `sbom-attestation-id` | SBOM attestation bundle ID |
+
+### Security Features
+
+All actions are **pinned to SHA** for supply chain security:
+
+```yaml
+uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+```
+
+Images pushed to GHCR include:
+- **SBOM attestation** - Full dependency manifest
+- **Build provenance** - Verifiable build metadata
+- **Vulnerability scan results** - Uploaded as SARIF to Security tab
 
 ## License
 
