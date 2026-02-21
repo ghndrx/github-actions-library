@@ -1,29 +1,45 @@
 # GitHub Actions Library
 
-![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=flat&logo=github-actions&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-2088FF?logo=github-actions&logoColor=white)](https://docs.github.com/en/actions/using-workflows/reusing-workflows)
 
-Reusable GitHub Actions workflows and composite actions for CI/CD pipelines.
+A curated collection of production-ready, reusable GitHub Actions workflows and composite actions for modern DevOps pipelines.
 
-## Workflows
+## 🎯 Overview
 
-| Workflow | Description |
-|----------|-------------|
-| [`python-ci.yml`](.github/workflows/python-ci.yml) | Python CI with UV (lint, type-check, test, security) |
-| [`docker-ci.yml`](.github/workflows/docker-ci.yml) | Docker CI/CD with OIDC, attestations, and security scanning |
+This repository provides battle-tested, security-hardened GitHub Actions components designed for:
 
-## Composite Actions
+- **CI/CD Pipelines** - Build, test, and deploy with confidence
+- **Security Scanning** - Shift-left security with automated vulnerability detection
+- **Infrastructure as Code** - Terraform workflows with proper state management
+- **Container Workflows** - Multi-arch Docker builds with attestations
+- **Python Development** - Fast CI with UV package manager
 
-| Action | Description |
-|--------|-------------|
-| [`setup-python-uv`](actions/setup-python-uv) | Fast Python setup with UV package manager |
+## 📁 Repository Structure
 
-## Quick Start
+```
+├── .github/workflows/           # Callable workflows in standard location
+│   ├── python-ci.yml           # Python CI with UV (lint, type-check, test)
+│   └── docker-ci.yml           # Docker CI/CD with OIDC and attestations
+├── reusable-workflows/          # Additional callable workflows
+│   ├── ci-docker.yml           # Docker build/push with security scanning
+│   ├── ci-terraform.yml        # Terraform plan/apply with drift detection
+│   └── security-audit.yml      # Comprehensive security scanning
+├── composite-actions/           # Reusable action components
+│   ├── docker-build/           # Multi-arch Docker build action
+│   ├── security-scan/          # Aggregated security scanning
+│   └── terraform-deploy/       # Terraform with remote state
+├── actions/                     # Additional composite actions
+│   └── setup-python-uv/        # Fast Python setup with UV
+├── workflow-templates/          # Starter templates for new projects
+└── docs/                        # Detailed documentation
+```
 
-### Python CI
+## 🚀 Quick Start
+
+### Python CI with UV
 
 ```yaml
-# .github/workflows/ci.yml
 name: CI
 on: [push, pull_request]
 
@@ -36,151 +52,103 @@ jobs:
       coverage-threshold: 80
 ```
 
-### Setup Python with UV (Composite Action)
+### Docker CI/CD
 
 ```yaml
-steps:
-  - uses: actions/checkout@v4
-  
-  - uses: ghndrx/github-actions-library/actions/setup-python-uv@main
-    with:
-      python-version: '3.12'
-      extras: 'dev,test'
-  
-  - run: uv run pytest
-```
-
-## Python CI Workflow Features
-
-The `python-ci.yml` reusable workflow provides:
-
-- **Ruff linting** - Fast Python linter with auto-fix suggestions
-- **Pyright type checking** - Strict type validation
-- **Matrix testing** - Test across multiple Python versions
-- **Coverage enforcement** - Fail if coverage drops below threshold
-- **Bandit security scanning** - Detect security vulnerabilities
-- **UV caching** - 10-100x faster than pip installs
-
-### Inputs
-
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `python-versions` | string | `'["3.12"]'` | JSON array of Python versions |
-| `working-directory` | string | `.` | Project directory |
-| `run-lint` | boolean | `true` | Run Ruff linter |
-| `run-typecheck` | boolean | `true` | Run Pyright |
-| `run-tests` | boolean | `true` | Run pytest |
-| `run-security` | boolean | `true` | Run Bandit scanner |
-| `test-command` | string | `pytest --cov --cov-report=xml` | Custom test command |
-| `coverage-threshold` | number | `0` | Min coverage % (0 to disable) |
-| `extras` | string | `''` | Extra dependency groups |
-
-## Requirements
-
-Projects using the Python CI workflow should have:
-
-- `pyproject.toml` with UV-compatible configuration
-- Dev dependencies: `ruff`, `pyright`, `pytest`, `pytest-cov`, `bandit`
-
-Example `pyproject.toml`:
-
-```toml
-[project]
-name = "myproject"
-requires-python = ">=3.11"
-
-[tool.uv]
-dev-dependencies = [
-    "ruff>=0.8",
-    "pyright>=1.1",
-    "pytest>=8.0",
-    "pytest-cov>=6.0",
-    "bandit>=1.8",
-]
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.pyright]
-pythonVersion = "3.12"
-typeCheckingMode = "standard"
-```
-
-## Docker CI Workflow Features
-
-The `docker-ci.yml` reusable workflow provides production-ready container builds:
-
-- **OIDC authentication** - Keyless auth to GHCR (no secrets needed)
-- **Multi-platform builds** - linux/amd64 + linux/arm64 by default
-- **SBOM generation** - Software Bill of Materials attestation
-- **Build provenance** - Cryptographic proof of build origin
-- **Trivy scanning** - Vulnerability detection with SARIF upload
-- **Smart caching** - GitHub Actions cache for layer reuse
-- **Semantic tagging** - Auto-tags from git refs and versions
-
-### Quick Start
-
-```yaml
-# .github/workflows/docker.yml
 name: Docker
-
 on:
   push:
     branches: [main]
-    tags: ['v*']
-  pull_request:
 
 jobs:
-  build:
+  docker:
     uses: ghndrx/github-actions-library/.github/workflows/docker-ci.yml@main
     with:
       image-name: my-app
-      push: ${{ github.event_name != 'pull_request' }}
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      push: true
+    secrets: inherit
 ```
 
-### Inputs
-
-| Input | Type | Default | Description |
-|-------|------|---------|-------------|
-| `image-name` | string | *required* | Image name (without registry) |
-| `context` | string | `.` | Docker build context path |
-| `dockerfile` | string | `Dockerfile` | Dockerfile path relative to context |
-| `push` | boolean | `false` | Push image to GHCR |
-| `platforms` | string | `linux/amd64,linux/arm64` | Target platforms |
-| `build-args` | string | `''` | Build args (newline-separated) |
-| `target` | string | `''` | Multi-stage build target |
-| `scan-severity` | string | `CRITICAL,HIGH` | Trivy severity threshold |
-| `fail-on-vuln` | boolean | `false` | Fail on vulnerabilities |
-| `generate-sbom` | boolean | `true` | Generate SBOM attestation |
-| `generate-provenance` | boolean | `true` | Generate provenance attestation |
-
-### Outputs
-
-| Output | Description |
-|--------|-------------|
-| `image-digest` | Image digest (sha256:...) |
-| `image-tags` | Generated tags (JSON array) |
-| `sbom-attestation-id` | SBOM attestation bundle ID |
-
-### Security Features
-
-All actions are **pinned to SHA** for supply chain security:
+### Terraform Infrastructure
 
 ```yaml
-uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+name: Infrastructure
+on:
+  pull_request:
+    paths: ['infrastructure/**']
+
+jobs:
+  terraform:
+    uses: ghndrx/github-actions-library/reusable-workflows/ci-terraform.yml@main
+    with:
+      working-directory: infrastructure
+      environment: production
+      apply: false
+    secrets:
+      aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
 ```
 
-Images pushed to GHCR include:
-- **SBOM attestation** - Full dependency manifest
-- **Build provenance** - Verifiable build metadata
-- **Vulnerability scan results** - Uploaded as SARIF to Security tab
+### Security Audit
 
-## License
+```yaml
+name: Security
+on:
+  schedule:
+    - cron: '0 6 * * *'
 
-MIT
+jobs:
+  security:
+    uses: ghndrx/github-actions-library/reusable-workflows/security-audit.yml@main
+    with:
+      scan-type: full
+      fail-on-severity: high
+```
+
+## 🔒 Security Features
+
+All workflows implement security best practices:
+
+- **Pinned Actions** - SHA-pinned dependencies to prevent supply chain attacks
+- **Minimal Permissions** - Least-privilege GITHUB_TOKEN permissions
+- **Secret Scanning** - Pre-commit hooks and CI checks for leaked secrets
+- **SBOM Generation** - Software Bill of Materials for container images
+- **Signed Artifacts** - Attestations for provenance and SBOM
+
+## 📚 Workflows Reference
+
+### Reusable Workflows
+
+| Workflow | Description | Key Features |
+|----------|-------------|--------------|
+| `python-ci.yml` | Python CI pipeline | UV, Ruff, mypy, pytest, coverage |
+| `docker-ci.yml` | Docker build & push | Multi-arch, OIDC, attestations |
+| `ci-docker.yml` | Enhanced Docker CI | Trivy scanning, SBOM, caching |
+| `ci-terraform.yml` | Terraform pipeline | Plan, apply, cost estimation |
+| `security-audit.yml` | Security scanning | SAST, secrets, deps, IaC |
+
+### Composite Actions
+
+| Action | Description |
+|--------|-------------|
+| `setup-python-uv` | Fast Python + UV setup |
+| `docker-build` | Streamlined Docker builds |
+| `security-scan` | Unified security scanning |
+| `terraform-deploy` | Terraform operations |
+
+## 📖 Documentation
+
+- [Reusable Workflows Guide](docs/reusable-workflows.md)
+- [Composite Actions Reference](docs/composite-actions.md)
+- [Security Best Practices](docs/security.md)
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+**Built with ❤️ for the DevOps community**

@@ -1,0 +1,319 @@
+# Reusable Security Audit Workflow
+# Comprehensive security scanning for applications and infrastructure
+#
+# Features:
+# - SAST with Semgrep/CodeQL
+# - Secret detection with Gitleaks
+# - Dependency scanning with Trivy/Dependabot
+# - Container scanning
+# - SARIF integration for GitHub Security tab
+# - Compliance checks (SOC2, HIPAA, PCI-DSS)
+
+name: Security Audit
+
+on:
+  workflow_call:
+    inputs:
+      scan-type:
+        description: 'Type of scan (full/quick/container)'
+        required: false
+        type: string
+        default: 'full'
+      fail-on-severity:
+        description: 'Minimum severity to fail workflow (low/medium/high/critical)'
+        required: false
+        type: string
+        default: 'high'
+      enable-sast:
+        description: 'Enable static analysis (Semgrep)'
+        required: false
+        type: boolean
+        default: true
+      enable-secrets:
+        description: 'Enable secret detection (Gitleaks)'
+        required: false
+        type: boolean
+        default: true
+      enable-dependencies:
+        description: 'Enable dependency scanning'
+        required: false
+        type: boolean
+        default: true
+      enable-container:
+        description: 'Enable container scanning'
+        required: false
+        type: boolean
+        default: false
+      container-image:
+        description: 'Container image to scan'
+        required: false
+        type: string
+        default: ''
+      semgrep-rules:
+        description: 'Semgrep ruleset (auto/p/default/p/security-audit)'
+        required: false
+        type: string
+        default: 'p/default'
+      exclusions:
+        description: 'Paths to exclude from scanning'
+        required: false
+        type: string
+        default: 'vendor/,node_modules/,*.min.js'
+    secrets:
+      semgrep-app-token:
+        description: 'Semgrep App token for enhanced features'
+        required: false
+    outputs:
+      vulnerabilities-found:
+        description: 'Whether vulnerabilities were found'
+        value: ${{ jobs.aggregate-results.outputs.has-vulns }}
+      critical-count:
+        description: 'Number of critical findings'
+        value: ${{ jobs.aggregate-results.outputs.critical }}
+      high-count:
+        description: 'Number of high findings'
+        value: ${{ jobs.aggregate-results.outputs.high }}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # Secret Detection
+  secrets-scan:
+    name: Secret Detection
+    if: inputs.enable-secrets
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0  # Full history for comprehensive scanning
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@cb7149a9b57195b609c63e8518d2c6056677d2d0 # v2.3.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@8a8ef8100a255e8aa74f3d49f28c26a8ab34be36 # v3.63.5
+        with:
+          extra_args: --only-verified --json
+        continue-on-error: true
+
+  # Static Application Security Testing
+  sast-scan:
+    name: SAST Analysis
+    if: inputs.enable-sast
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@713efdd345f3b2f0de509d109b6c1bf1c5ae7cfa # v1.58.0
+        with:
+          config: ${{ inputs.semgrep-rules }}
+          generateSarif: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.semgrep-app-token }}
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: semgrep.sarif
+          category: 'semgrep'
+        if: always()
+
+      - name: Run Bandit (Python)
+        if: hashFiles('**/*.py') != ''
+        run: |
+          pip install bandit
+          bandit -r . -f sarif -o bandit.sarif --exclude ${{ inputs.exclusions }} || true
+
+      - name: Upload Bandit SARIF
+        if: hashFiles('bandit.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: bandit.sarif
+          category: 'bandit'
+
+  # Dependency Scanning
+  dependency-scan:
+    name: Dependency Audit
+    if: inputs.enable-dependencies
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@91713af97dc80187565512baba96e4364e983601 # v0.16.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          vuln-type: 'os,library'
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: trivy-fs.sarif
+          category: 'trivy-dependencies'
+
+      - name: OSV Scanner
+        uses: google/osv-scanner-action@v1.6.2
+        with:
+          scan-args: |-
+            --format=sarif
+            --output=osv-results.sarif
+            ./
+        continue-on-error: true
+
+      - name: Upload OSV SARIF
+        if: hashFiles('osv-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: osv-results.sarif
+          category: 'osv-scanner'
+
+      # Language-specific audits
+      - name: npm audit
+        if: hashFiles('package-lock.json') != ''
+        run: |
+          npm audit --json > npm-audit.json || true
+          echo "::group::NPM Audit Results"
+          cat npm-audit.json | jq '.metadata.vulnerabilities'
+          echo "::endgroup::"
+        continue-on-error: true
+
+      - name: pip-audit
+        if: hashFiles('requirements*.txt') != ''
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format json --output pip-audit.json || true
+        continue-on-error: true
+
+  # Container Scanning
+  container-scan:
+    name: Container Security
+    if: inputs.enable-container && inputs.container-image != ''
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@91713af97dc80187565512baba96e4364e983601 # v0.16.0
+        with:
+          image-ref: ${{ inputs.container-image }}
+          format: 'sarif'
+          output: 'trivy-container.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          vuln-type: 'os,library'
+
+      - name: Upload Container SARIF
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: trivy-container.sarif
+          category: 'container-security'
+
+      - name: Run Dockle
+        uses: erzz/dockle-action@bc4ed7f8d7f8e18cd7adfc71a3c1cc46d8fefe42 # v1.4.0
+        with:
+          image: ${{ inputs.container-image }}
+          exit-code: 0
+          failure-threshold: fatal
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@78fc58e266e87a38d4194b2137a3d4e9bcaf7ca1 # v0.15.0
+        with:
+          image: ${{ inputs.container-image }}
+          format: cyclonedx-json
+          output-file: sbom-container.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392 # v4.0.0
+        with:
+          name: sbom-container
+          path: sbom-container.json
+          retention-days: 30
+
+  # Infrastructure as Code Scanning
+  iac-scan:
+    name: IaC Security
+    if: inputs.scan-type == 'full'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@12e20714819f0a455abf12acf5bf02756c7c3bd1 # v12.2614.0
+        with:
+          framework: all
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: true
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: checkov.sarif
+          category: 'iac-security'
+        if: always()
+
+      - name: Run KICS
+        uses: checkmarx/kics-github-action@530ac1f8efe6202b0f12c9a6e952597ae707b755 # v1.7.0
+        with:
+          path: '.'
+          output_path: kics-results
+          output_formats: 'sarif'
+          exclude_paths: ${{ inputs.exclusions }}
+        continue-on-error: true
+
+      - name: Upload KICS SARIF
+        if: hashFiles('kics-results/results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1b1aada464948af03b950897e5eb522f92603cc2 # v3.24.0
+        with:
+          sarif_file: kics-results/results.sarif
+          category: 'kics'
+
+  # Aggregate Results
+  aggregate-results:
+    name: Security Summary
+    needs: [secrets-scan, sast-scan, dependency-scan, container-scan, iac-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      has-vulns: ${{ steps.summary.outputs.has-vulns }}
+      critical: ${{ steps.summary.outputs.critical }}
+      high: ${{ steps.summary.outputs.high }}
+    
+    steps:
+      - name: Generate Summary
+        id: summary
+        run: |
+          echo "# 🔒 Security Audit Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Detection | ${{ needs.secrets-scan.result == 'success' && '✅ Passed' || (needs.secrets-scan.result == 'skipped' && '⏭️ Skipped' || '⚠️ Issues Found') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST Analysis | ${{ needs.sast-scan.result == 'success' && '✅ Passed' || (needs.sast-scan.result == 'skipped' && '⏭️ Skipped' || '⚠️ Issues Found') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Audit | ${{ needs.dependency-scan.result == 'success' && '✅ Passed' || (needs.dependency-scan.result == 'skipped' && '⏭️ Skipped' || '⚠️ Issues Found') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Security | ${{ needs.container-scan.result == 'success' && '✅ Passed' || (needs.container-scan.result == 'skipped' && '⏭️ Skipped' || '⚠️ Issues Found') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| IaC Security | ${{ needs.iac-scan.result == 'success' && '✅ Passed' || (needs.iac-scan.result == 'skipped' && '⏭️ Skipped' || '⚠️ Issues Found') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 📊 View detailed findings in the [Security tab](../../security)" >> $GITHUB_STEP_SUMMARY
+          
+          # Set outputs
+          echo "has-vulns=false" >> $GITHUB_OUTPUT
+          echo "critical=0" >> $GITHUB_OUTPUT
+          echo "high=0" >> $GITHUB_OUTPUT

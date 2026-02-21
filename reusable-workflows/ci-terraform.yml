@@ -1,0 +1,314 @@
+# Reusable Terraform CI/CD Workflow
+# Provides: Plan, apply, and drift detection for infrastructure as code
+#
+# Features:
+# - Multi-environment support (dev/staging/prod)
+# - Plan output as PR comment
+# - Drift detection on schedule
+# - State locking and remote backends
+# - Cost estimation with Infracost
+# - Policy enforcement with OPA/Conftest
+
+name: Terraform CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: 'Directory containing Terraform configuration'
+        required: false
+        type: string
+        default: '.'
+      terraform-version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.6.6'
+      environment:
+        description: 'Target environment (dev/staging/prod)'
+        required: true
+        type: string
+      apply:
+        description: 'Apply changes (requires approval for prod)'
+        required: false
+        type: boolean
+        default: false
+      destroy:
+        description: 'Destroy infrastructure (dangerous!)'
+        required: false
+        type: boolean
+        default: false
+      var-file:
+        description: 'Path to tfvars file'
+        required: false
+        type: string
+        default: ''
+      backend-config:
+        description: 'Backend configuration file'
+        required: false
+        type: string
+        default: ''
+      enable-cost-estimation:
+        description: 'Enable Infracost cost estimation'
+        required: false
+        type: boolean
+        default: true
+      enable-policy-check:
+        description: 'Enable OPA/Conftest policy checks'
+        required: false
+        type: boolean
+        default: false
+      policy-path:
+        description: 'Path to policy directory'
+        required: false
+        type: string
+        default: 'policies'
+    secrets:
+      tf-api-token:
+        description: 'Terraform Cloud API token'
+        required: false
+      aws-access-key-id:
+        description: 'AWS access key ID'
+        required: false
+      aws-secret-access-key:
+        description: 'AWS secret access key'
+        required: false
+      aws-role-arn:
+        description: 'AWS IAM role to assume (OIDC)'
+        required: false
+      infracost-api-key:
+        description: 'Infracost API key'
+        required: false
+    outputs:
+      plan-exit-code:
+        description: 'Terraform plan exit code (0=no changes, 2=changes)'
+        value: ${{ jobs.plan.outputs.exit-code }}
+      has-changes:
+        description: 'Whether infrastructure changes are detected'
+        value: ${{ jobs.plan.outputs.has-changes }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # Required for OIDC
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          cli_config_credentials_token: ${{ secrets.tf-api-token }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          INIT_ARGS=""
+          if [ -n "${{ inputs.backend-config }}" ]; then
+            INIT_ARGS="-backend-config=${{ inputs.backend-config }}"
+          fi
+          terraform init -upgrade $INIT_ARGS
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: TFLint
+        uses: terraform-linters/setup-tflint@19a52fbac37dacb22a09518e4ef6ee234f2d4987 # v4.0.0
+        with:
+          tflint_version: latest
+
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --format compact --recursive
+
+      - name: Checkov Security Scan
+        uses: bridgecrewio/checkov-action@12e20714819f0a455abf12acf5bf02756c7c3bd1 # v12.2614.0
+        with:
+          directory: ${{ inputs.working-directory }}
+          framework: terraform
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+  plan:
+    name: Plan (${{ inputs.environment }})
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      exit-code: ${{ steps.plan.outputs.exitcode }}
+      has-changes: ${{ steps.plan.outputs.exitcode == 2 }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Configure AWS credentials (OIDC)
+        if: secrets.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: us-east-1
+
+      - name: Configure AWS credentials (Keys)
+        if: secrets.aws-role-arn == '' && secrets.aws-access-key-id != ''
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          cli_config_credentials_token: ${{ secrets.tf-api-token }}
+
+      - name: Terraform Init
+        run: |
+          INIT_ARGS=""
+          if [ -n "${{ inputs.backend-config }}" ]; then
+            INIT_ARGS="-backend-config=${{ inputs.backend-config }}"
+          fi
+          terraform init -upgrade $INIT_ARGS
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          PLAN_ARGS="-detailed-exitcode -out=tfplan"
+          if [ -n "${{ inputs.var-file }}" ]; then
+            PLAN_ARGS="$PLAN_ARGS -var-file=${{ inputs.var-file }}"
+          fi
+          terraform plan $PLAN_ARGS
+        continue-on-error: true
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392 # v4.0.0
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}/tfplan
+          retention-days: 5
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = `#### Terraform Plan - \`${{ inputs.environment }}\`
+            
+            | Step | Status |
+            |------|--------|
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅' || '⚠️' }} |
+            | Init | ${{ steps.init.outcome == 'success' && '✅' || '❌' }} |
+            | Validate | ${{ steps.validate.outcome == 'success' && '✅' || '❌' }} |
+            | Plan | ${{ steps.plan.outcome == 'success' && '✅' || (steps.plan.outputs.exitcode == 2 && '⚠️ Changes' || '❌') }} |
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: planOutput
+            });
+
+  cost-estimation:
+    name: Cost Estimation
+    needs: plan
+    if: inputs.enable-cost-estimation && needs.plan.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@c3c30ad45f0a21ed0d3f95a6791acfde02b2cc55 # v2.1.0
+        with:
+          api-key: ${{ secrets.infracost-api-key }}
+
+      - name: Generate cost estimate
+        run: |
+          infracost breakdown --path=${{ inputs.working-directory }} \
+            --format=json --out-file=/tmp/infracost.json
+
+      - name: Post cost comment
+        if: github.event_name == 'pull_request'
+        run: |
+          infracost comment github --path=/tmp/infracost.json \
+            --repo=${{ github.repository }} \
+            --github-token=${{ github.token }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update
+
+  apply:
+    name: Apply (${{ inputs.environment }})
+    needs: [plan, cost-estimation]
+    if: |
+      always() &&
+      inputs.apply &&
+      needs.plan.outputs.has-changes == 'true' &&
+      (needs.cost-estimation.result == 'success' || needs.cost-estimation.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Download Plan
+        uses: actions/download-artifact@f44cd7b40bfd40b6aa1cc1b9b5b7bf03d3c67110 # v4.1.0
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Configure AWS credentials
+        if: secrets.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          cli_config_credentials_token: ${{ secrets.tf-api-token }}
+
+      - name: Terraform Init
+        run: |
+          INIT_ARGS=""
+          if [ -n "${{ inputs.backend-config }}" ]; then
+            INIT_ARGS="-backend-config=${{ inputs.backend-config }}"
+          fi
+          terraform init -upgrade $INIT_ARGS
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan

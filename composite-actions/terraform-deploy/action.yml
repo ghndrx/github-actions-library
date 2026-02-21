@@ -1,0 +1,245 @@
+# Terraform Deploy Composite Action
+# Streamlined Terraform operations with best practices
+#
+# Usage:
+#   - uses: gregorygreenspan/github-actions-library/composite-actions/terraform-deploy@main
+#     with:
+#       working-directory: ./infrastructure
+#       command: plan
+
+name: 'Terraform Deploy'
+description: 'Execute Terraform commands with security and state management best practices'
+author: 'Gregory Greenspan'
+
+branding:
+  icon: 'server'
+  color: 'purple'
+
+inputs:
+  working-directory:
+    description: 'Directory containing Terraform configuration'
+    required: false
+    default: '.'
+  terraform-version:
+    description: 'Terraform version'
+    required: false
+    default: 'latest'
+  command:
+    description: 'Terraform command (init/validate/plan/apply/destroy)'
+    required: true
+  var-file:
+    description: 'Path to tfvars file'
+    required: false
+    default: ''
+  backend-config:
+    description: 'Backend configuration (key=value format, newline-separated)'
+    required: false
+    default: ''
+  variables:
+    description: 'Terraform variables (key=value format, newline-separated)'
+    required: false
+    default: ''
+  auto-approve:
+    description: 'Skip interactive approval for apply/destroy'
+    required: false
+    default: 'false'
+  plan-file:
+    description: 'Path to save/use plan file'
+    required: false
+    default: 'tfplan'
+  lock:
+    description: 'Lock state during operations'
+    required: false
+    default: 'true'
+  lock-timeout:
+    description: 'State lock timeout'
+    required: false
+    default: '5m'
+  parallelism:
+    description: 'Limit concurrent operations'
+    required: false
+    default: '10'
+  tf-token:
+    description: 'Terraform Cloud API token'
+    required: false
+    default: ''
+
+outputs:
+  exitcode:
+    description: 'Terraform command exit code'
+    value: ${{ steps.terraform.outputs.exitcode }}
+  plan-has-changes:
+    description: 'Whether plan detected changes (plan command only)'
+    value: ${{ steps.terraform.outputs.has-changes }}
+  outputs-json:
+    description: 'Terraform outputs as JSON'
+    value: ${{ steps.outputs.outputs.json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        cli_config_credentials_token: ${{ inputs.tf-token }}
+        terraform_wrapper: false
+
+    - name: Terraform Format Check
+      if: inputs.command == 'validate' || inputs.command == 'plan'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🎨 Checking Terraform formatting..."
+        terraform fmt -check -recursive -diff || {
+          echo "::warning::Terraform files are not properly formatted. Run 'terraform fmt -recursive'"
+        }
+
+    - name: Terraform Init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🚀 Initializing Terraform..."
+        INIT_ARGS="-input=false -upgrade"
+        
+        # Add backend config if provided
+        if [ -n "${{ inputs.backend-config }}" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] && INIT_ARGS="$INIT_ARGS -backend-config=\"$line\""
+          done <<< "${{ inputs.backend-config }}"
+        fi
+        
+        eval terraform init $INIT_ARGS
+
+    - name: Terraform Validate
+      if: inputs.command == 'validate' || inputs.command == 'plan' || inputs.command == 'apply'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "✅ Validating Terraform configuration..."
+        terraform validate -no-color
+
+    - name: Build Terraform Arguments
+      id: args
+      shell: bash
+      run: |
+        ARGS=""
+        
+        # Variable file
+        if [ -n "${{ inputs.var-file }}" ]; then
+          ARGS="$ARGS -var-file=${{ inputs.var-file }}"
+        fi
+        
+        # Inline variables
+        if [ -n "${{ inputs.variables }}" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] && ARGS="$ARGS -var \"$line\""
+          done <<< "${{ inputs.variables }}"
+        fi
+        
+        # Locking
+        if [ "${{ inputs.lock }}" == "true" ]; then
+          ARGS="$ARGS -lock=true -lock-timeout=${{ inputs.lock-timeout }}"
+        else
+          ARGS="$ARGS -lock=false"
+        fi
+        
+        # Parallelism
+        ARGS="$ARGS -parallelism=${{ inputs.parallelism }}"
+        
+        echo "args=$ARGS" >> $GITHUB_OUTPUT
+
+    - name: Terraform Plan
+      if: inputs.command == 'plan'
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "📋 Running Terraform plan..."
+        set +e
+        eval terraform plan -detailed-exitcode -out=${{ inputs.plan-file }} ${{ steps.args.outputs.args }}
+        EXIT_CODE=$?
+        set -e
+        
+        echo "exitcode=$EXIT_CODE" >> $GITHUB_OUTPUT
+        
+        if [ $EXIT_CODE -eq 2 ]; then
+          echo "has-changes=true" >> $GITHUB_OUTPUT
+          echo "::notice::Terraform plan detected changes"
+        else
+          echo "has-changes=false" >> $GITHUB_OUTPUT
+        fi
+        
+        # Exit 1 is error, 0 is no changes, 2 is changes
+        [ $EXIT_CODE -eq 1 ] && exit 1
+        exit 0
+
+    - name: Terraform Apply
+      if: inputs.command == 'apply'
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "🚀 Applying Terraform changes..."
+        
+        APPLY_ARGS="${{ steps.args.outputs.args }}"
+        
+        if [ "${{ inputs.auto-approve }}" == "true" ]; then
+          APPLY_ARGS="$APPLY_ARGS -auto-approve"
+        fi
+        
+        # Use plan file if it exists
+        if [ -f "${{ inputs.plan-file }}" ]; then
+          terraform apply ${{ inputs.plan-file }}
+        else
+          eval terraform apply $APPLY_ARGS
+        fi
+        
+        echo "exitcode=$?" >> $GITHUB_OUTPUT
+
+    - name: Terraform Destroy
+      if: inputs.command == 'destroy'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "💥 Destroying Terraform resources..."
+        
+        DESTROY_ARGS="${{ steps.args.outputs.args }}"
+        
+        if [ "${{ inputs.auto-approve }}" == "true" ]; then
+          DESTROY_ARGS="$DESTROY_ARGS -auto-approve"
+        fi
+        
+        eval terraform destroy $DESTROY_ARGS
+
+    - name: Terraform Output
+      id: outputs
+      if: inputs.command == 'apply' || inputs.command == 'output'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        OUTPUTS=$(terraform output -json 2>/dev/null || echo '{}')
+        echo "json=$OUTPUTS" >> $GITHUB_OUTPUT
+
+    - name: Set Outputs
+      id: terraform
+      shell: bash
+      run: |
+        # Aggregate outputs from previous steps
+        if [ -n "${{ steps.plan.outputs.exitcode }}" ]; then
+          echo "exitcode=${{ steps.plan.outputs.exitcode }}" >> $GITHUB_OUTPUT
+          echo "has-changes=${{ steps.plan.outputs.has-changes }}" >> $GITHUB_OUTPUT
+        elif [ -n "${{ steps.apply.outputs.exitcode }}" ]; then
+          echo "exitcode=${{ steps.apply.outputs.exitcode }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Summary
+      shell: bash
+      run: |
+        echo "### 🏗️ Terraform ${{ inputs.command }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Directory | \`${{ inputs.working-directory }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Command | \`${{ inputs.command }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | ${{ inputs.terraform-version }} |" >> $GITHUB_STEP_SUMMARY
