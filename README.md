@@ -14,12 +14,14 @@ This repository provides battle-tested, security-hardened GitHub Actions compone
 - **Infrastructure as Code** - Terraform workflows with proper state management
 - **Container Workflows** - Multi-arch Docker builds with attestations
 - **Python Development** - Fast CI with UV package manager
+- **Go Development** - Linting, security scanning, and testing for Go projects
 
 ## 📁 Repository Structure
 
 ```
 ├── .github/workflows/           # Callable workflows in standard location
 │   ├── python-ci.yml           # Python CI with UV (lint, type-check, test)
+│   ├── go-ci.yml               # Go CI with golangci-lint, govulncheck, testing
 │   └── docker-ci.yml           # Docker CI/CD with OIDC and attestations
 ├── reusable-workflows/          # Additional callable workflows
 │   ├── ci-docker.yml           # Docker build/push with security scanning
@@ -50,6 +52,24 @@ jobs:
       python-versions: '["3.11", "3.12", "3.13"]'
       run-typecheck: true
       coverage-threshold: 80
+```
+
+### Go CI
+
+```yaml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  ci:
+    uses: ghndrx/github-actions-library/.github/workflows/go-ci.yml@main
+    with:
+      go-versions: '["1.22", "1.23"]'
+      coverage-threshold: 70
+      race-detection: true
+    permissions:
+      contents: read
+      security-events: write
 ```
 
 ### Docker CI/CD
@@ -121,6 +141,7 @@ All workflows implement security best practices:
 | Workflow | Description | Key Features |
 |----------|-------------|--------------|
 | `python-ci.yml` | Python CI pipeline | UV, Ruff, mypy, pytest, coverage |
+| `go-ci.yml` | Go CI pipeline | golangci-lint, govulncheck, gosec, coverage |
 | `docker-ci.yml` | Docker build & push | Multi-arch, OIDC, attestations |
 | `ci-docker.yml` | Enhanced Docker CI | Trivy scanning, SBOM, caching |
 | `ci-terraform.yml` | Terraform pipeline | Plan, apply, cost estimation |

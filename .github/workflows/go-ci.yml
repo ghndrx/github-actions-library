@@ -1,0 +1,307 @@
+# Reusable Go CI Workflow
+# Provides: Linting, security scanning, testing, and coverage for Go projects
+#
+# Features:
+# - golangci-lint with configurable rules
+# - govulncheck vulnerability scanning
+# - Matrix testing across Go versions
+# - Coverage thresholds with enforcement
+# - Race condition detection
+# - Module caching for fast builds
+# - Gosec security analysis
+
+name: Go CI
+
+on:
+  workflow_call:
+    inputs:
+      go-versions:
+        description: 'JSON array of Go versions to test'
+        required: false
+        type: string
+        default: '["1.22", "1.23"]'
+      working-directory:
+        description: 'Directory containing go.mod'
+        required: false
+        type: string
+        default: '.'
+      run-lint:
+        description: 'Run golangci-lint'
+        required: false
+        type: boolean
+        default: true
+      run-security:
+        description: 'Run govulncheck and gosec'
+        required: false
+        type: boolean
+        default: true
+      run-tests:
+        description: 'Run tests with coverage'
+        required: false
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: 'Minimum coverage percentage (0 to disable)'
+        required: false
+        type: number
+        default: 0
+      test-flags:
+        description: 'Additional flags for go test'
+        required: false
+        type: string
+        default: ''
+      build-flags:
+        description: 'Additional flags for go build'
+        required: false
+        type: string
+        default: ''
+      lint-args:
+        description: 'Additional golangci-lint arguments'
+        required: false
+        type: string
+        default: ''
+      race-detection:
+        description: 'Enable race detector in tests'
+        required: false
+        type: boolean
+        default: true
+      timeout-minutes:
+        description: 'Job timeout in minutes'
+        required: false
+        type: number
+        default: 15
+    outputs:
+      coverage:
+        description: 'Test coverage percentage'
+        value: ${{ jobs.test.outputs.coverage }}
+
+permissions:
+  contents: read
+  security-events: write  # For SARIF upload
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOPRIVATE: ''
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Lint Job - Static Analysis with golangci-lint
+  # ─────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    if: inputs.run-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: 'stable'
+          cache: true
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Verify dependencies
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum || {
+            echo "::error::go.mod or go.sum is not tidy. Run 'go mod tidy' and commit changes."
+            exit 1
+          }
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8.0.0
+        with:
+          version: latest
+          working-directory: ${{ inputs.working-directory }}
+          args: --timeout=5m ${{ inputs.lint-args }}
+          # Only show new issues in PRs
+          only-new-issues: ${{ github.event_name == 'pull_request' }}
+
+  # ─────────────────────────────────────────────────────────────
+  # Security Job - Vulnerability Scanning
+  # ─────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    if: inputs.run-security
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: 'stable'
+          cache: true
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Run gosec
+        uses: securego/gosec@6fbd381238e97e1d1f3571f527c133e74c6ed72f # v2.21.4
+        with:
+          args: '-no-fail -fmt sarif -out gosec-results.sarif ${{ inputs.working-directory }}/...'
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f # v3.28.18
+        if: always()
+        with:
+          sarif_file: gosec-results.sarif
+
+  # ─────────────────────────────────────────────────────────────
+  # Test Job - Build and Test Matrix
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: Test (Go ${{ matrix.go-version }})
+    if: inputs.run-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      coverage: ${{ steps.coverage.outputs.percentage }}
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ${{ fromJson(inputs.go-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build -v ${{ inputs.build-flags }} ./...
+
+      - name: Run tests
+        id: test
+        run: |
+          TEST_FLAGS="-v -coverprofile=coverage.out -covermode=atomic"
+          
+          # Add race detector if enabled
+          if [ "${{ inputs.race-detection }}" == "true" ]; then
+            TEST_FLAGS="$TEST_FLAGS -race"
+          fi
+          
+          # Add custom flags
+          if [ -n "${{ inputs.test-flags }}" ]; then
+            TEST_FLAGS="$TEST_FLAGS ${{ inputs.test-flags }}"
+          fi
+          
+          go test $TEST_FLAGS ./...
+
+      - name: Calculate coverage
+        id: coverage
+        run: |
+          if [ -f coverage.out ]; then
+            COVERAGE=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | sed 's/%//')
+            echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+            echo "📊 **Coverage:** ${COVERAGE}%" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "percentage=0" >> $GITHUB_OUTPUT
+            echo "::warning::No coverage data generated"
+          fi
+
+      - name: Check coverage threshold
+        if: inputs.coverage-threshold > 0
+        run: |
+          COVERAGE="${{ steps.coverage.outputs.percentage }}"
+          THRESHOLD="${{ inputs.coverage-threshold }}"
+          
+          if [ -z "$COVERAGE" ]; then
+            echo "::error::Could not determine coverage"
+            exit 1
+          fi
+          
+          # Compare using bc for floating point
+          if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "::error::Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            exit 1
+          fi
+          
+          echo "✅ Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+
+      - name: Upload coverage to Codecov
+        if: matrix.go-version == fromJson(inputs.go-versions)[0]
+        uses: codecov/codecov-action@ad3126e916f78f00edff4ed0317cf185271ccc2d # v5.4.2
+        with:
+          files: ${{ inputs.working-directory }}/coverage.out
+          fail_ci_if_error: false
+          verbose: true
+
+  # ─────────────────────────────────────────────────────────────
+  # Summary Job
+  # ─────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    needs: [lint, security, test]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check job results
+        run: |
+          echo "## Go CI Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Lint status
+          if [ "${{ needs.lint.result }}" == "success" ]; then
+            echo "| Lint | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.lint.result }}" == "skipped" ]; then
+            echo "| Lint | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Lint | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Security status
+          if [ "${{ needs.security.result }}" == "success" ]; then
+            echo "| Security | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.security.result }}" == "skipped" ]; then
+            echo "| Security | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Security | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Test status
+          if [ "${{ needs.test.result }}" == "success" ]; then
+            echo "| Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.test.result }}" == "skipped" ]; then
+            echo "| Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Fail if any required job failed
+          if [ "${{ needs.lint.result }}" == "failure" ] || \
+             [ "${{ needs.security.result }}" == "failure" ] || \
+             [ "${{ needs.test.result }}" == "failure" ]; then
+            exit 1
+          fi
