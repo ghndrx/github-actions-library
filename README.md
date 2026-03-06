@@ -108,6 +108,27 @@ jobs:
       aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
 ```
 
+### AWS Deployment (OIDC)
+
+```yaml
+name: Deploy to AWS
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy-ecs:
+    uses: ghndrx/github-actions-library/reusable-workflows/deploy-aws-oidc.yml@main
+    with:
+      aws-region: us-east-1
+      environment: production
+      ecr-repository: my-app
+      ecs-cluster: prod-cluster
+      ecs-service: my-app-service
+    secrets:
+      aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+```
+
 ### Security Audit
 
 ```yaml
@@ -146,6 +167,7 @@ All workflows implement security best practices:
 | `ci-docker.yml` | Enhanced Docker CI | Trivy scanning, SBOM, caching |
 | `ci-terraform.yml` | Terraform pipeline | Plan, apply, cost estimation |
 | `security-audit.yml` | Security scanning | SAST, secrets, deps, IaC |
+| `deploy-aws-oidc.yml` | AWS deployment (OIDC) | ECS, Lambda, S3, keyless auth |
 
 ### Composite Actions
 

@@ -1,0 +1,358 @@
+name: AWS Deployment (OIDC)
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: 'AWS region to deploy to'
+        required: true
+        type: string
+      environment:
+        description: 'Deployment environment (dev, staging, production)'
+        required: true
+        type: string
+      working-directory:
+        description: 'Working directory for deployment scripts'
+        required: false
+        type: string
+        default: '.'
+      ecr-repository:
+        description: 'ECR repository name (optional, for container deployments)'
+        required: false
+        type: string
+      ecs-cluster:
+        description: 'ECS cluster name (optional, for ECS deployments)'
+        required: false
+        type: string
+      ecs-service:
+        description: 'ECS service name (optional, for ECS deployments)'
+        required: false
+        type: string
+      lambda-function:
+        description: 'Lambda function name (optional, for Lambda deployments)'
+        required: false
+        type: string
+      s3-bucket:
+        description: 'S3 bucket for static site deployment (optional)'
+        required: false
+        type: string
+      cloudfront-distribution:
+        description: 'CloudFront distribution ID for cache invalidation (optional)'
+        required: false
+        type: string
+      run-smoke-tests:
+        description: 'Run smoke tests after deployment'
+        required: false
+        type: boolean
+        default: false
+      smoke-test-command:
+        description: 'Command to run smoke tests'
+        required: false
+        type: string
+        default: 'npm run test:smoke'
+      deployment-timeout:
+        description: 'Deployment timeout in seconds'
+        required: false
+        type: number
+        default: 300
+    secrets:
+      aws-role-arn:
+        description: 'AWS IAM Role ARN for OIDC authentication'
+        required: true
+      slack-webhook:
+        description: 'Slack webhook for deployment notifications (optional)'
+        required: false
+    outputs:
+      deployment-status:
+        description: 'Status of the deployment (success/failure)'
+        value: ${{ jobs.deploy.outputs.status }}
+      deployment-timestamp:
+        description: 'Timestamp of the deployment'
+        value: ${{ jobs.deploy.outputs.timestamp }}
+      image-tag:
+        description: 'Container image tag (if applicable)'
+        value: ${{ jobs.deploy.outputs.image-tag }}
+
+permissions:
+  id-token: write    # Required for OIDC token
+  contents: read     # Required for checkout
+  packages: read     # Required for private packages
+
+jobs:
+  deploy:
+    name: Deploy to AWS (${{ inputs.environment }})
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    timeout-minutes: ${{ inputs.deployment-timeout / 60 }}
+    outputs:
+      status: ${{ steps.deployment-status.outputs.status }}
+      timestamp: ${{ steps.deployment-status.outputs.timestamp }}
+      image-tag: ${{ steps.build-info.outputs.tag }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0  # Full history for versioning
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: github-actions-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Verify AWS credentials
+        run: |
+          echo "::group::AWS Identity"
+          aws sts get-caller-identity
+          echo "::endgroup::"
+          echo "✅ AWS authentication successful"
+
+      - name: Generate build metadata
+        id: build-info
+        run: |
+          # Generate semantic version tag
+          TAG="$(date +%Y%m%d)-${GITHUB_SHA::8}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          echo "run_id=${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+          echo "run_number=${GITHUB_RUN_NUMBER}" >> $GITHUB_OUTPUT
+          
+          echo "::notice title=Build Tag::${TAG}"
+
+      # ECR + ECS Deployment Path
+      - name: Login to Amazon ECR
+        if: inputs.ecr-repository != ''
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+        with:
+          mask-password: true
+
+      - name: Build and push Docker image to ECR
+        if: inputs.ecr-repository != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          IMAGE_TAG: ${{ steps.build-info.outputs.tag }}
+        run: |
+          echo "::group::Building Docker image"
+          docker build \
+            --tag "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+            --tag "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
+            --label "git.commit=${GITHUB_SHA}" \
+            --label "git.branch=${GITHUB_REF_NAME}" \
+            --label "build.timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "build.run_id=${GITHUB_RUN_ID}" \
+            .
+          echo "::endgroup::"
+          
+          echo "::group::Pushing to ECR"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+          echo "::endgroup::"
+          
+          echo "::notice title=Image Pushed::${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+      - name: Deploy to Amazon ECS
+        if: inputs.ecs-cluster != '' && inputs.ecs-service != ''
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          IMAGE_TAG: ${{ steps.build-info.outputs.tag }}
+          ECS_CLUSTER: ${{ inputs.ecs-cluster }}
+          ECS_SERVICE: ${{ inputs.ecs-service }}
+        run: |
+          echo "::group::Updating ECS service"
+          
+          # Get current task definition
+          TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          
+          # Create new task definition revision with updated image
+          NEW_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_DEFINITION}" \
+            --query 'taskDefinition' \
+            | jq --arg IMAGE "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+               '.containerDefinitions[0].image = $IMAGE | 
+                del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Register new task definition
+          NEW_REVISION=$(echo "${NEW_TASK_DEF}" \
+            | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
+            | jq -r '.taskDefinition.taskDefinitionArn')
+          
+          echo "New task definition: ${NEW_REVISION}"
+          
+          # Update service
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --task-definition "${NEW_REVISION}" \
+            --force-new-deployment
+          
+          echo "::endgroup::"
+          echo "::notice title=ECS Deployment::Service ${ECS_SERVICE} updated with ${IMAGE_TAG}"
+
+      - name: Wait for ECS deployment to stabilize
+        if: inputs.ecs-cluster != '' && inputs.ecs-service != ''
+        env:
+          ECS_CLUSTER: ${{ inputs.ecs-cluster }}
+          ECS_SERVICE: ${{ inputs.ecs-service }}
+        run: |
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}"
+          echo "✅ ECS service is stable"
+
+      # Lambda Deployment Path
+      - name: Deploy to AWS Lambda
+        if: inputs.lambda-function != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          LAMBDA_FUNCTION: ${{ inputs.lambda-function }}
+          IMAGE_TAG: ${{ steps.build-info.outputs.tag }}
+        run: |
+          echo "::group::Deploying to Lambda"
+          
+          # Package Lambda function
+          if [ -f "package.json" ]; then
+            npm ci --production
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt -t .
+          fi
+          
+          zip -r function.zip . -x "*.git*" -x "*node_modules/.cache*" -x "*__pycache__*"
+          
+          # Update function code
+          aws lambda update-function-code \
+            --function-name "${LAMBDA_FUNCTION}" \
+            --zip-file fileb://function.zip
+          
+          # Wait for update to complete
+          aws lambda wait function-updated \
+            --function-name "${LAMBDA_FUNCTION}"
+          
+          # Update environment variables with deployment metadata
+          aws lambda update-function-configuration \
+            --function-name "${LAMBDA_FUNCTION}" \
+            --environment "Variables={DEPLOY_TAG=${IMAGE_TAG},DEPLOY_SHA=${GITHUB_SHA::8},DEPLOY_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+          
+          echo "::endgroup::"
+          echo "::notice title=Lambda Deployment::Function ${LAMBDA_FUNCTION} updated"
+
+      # S3 + CloudFront Static Site Deployment
+      - name: Deploy to S3
+        if: inputs.s3-bucket != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          S3_BUCKET: ${{ inputs.s3-bucket }}
+        run: |
+          echo "::group::Deploying to S3"
+          
+          # Sync build directory to S3
+          if [ -d "dist" ]; then
+            UPLOAD_DIR="dist"
+          elif [ -d "build" ]; then
+            UPLOAD_DIR="build"
+          else
+            echo "❌ No dist/ or build/ directory found"
+            exit 1
+          fi
+          
+          aws s3 sync "${UPLOAD_DIR}/" "s3://${S3_BUCKET}/" \
+            --delete \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "*.html" \
+            --exclude "service-worker.js"
+          
+          # Upload HTML with no-cache
+          aws s3 sync "${UPLOAD_DIR}/" "s3://${S3_BUCKET}/" \
+            --exclude "*" \
+            --include "*.html" \
+            --include "service-worker.js" \
+            --cache-control "public,max-age=0,must-revalidate"
+          
+          echo "::endgroup::"
+          echo "::notice title=S3 Deployment::Files synced to s3://${S3_BUCKET}"
+
+      - name: Invalidate CloudFront cache
+        if: inputs.cloudfront-distribution != ''
+        env:
+          DISTRIBUTION_ID: ${{ inputs.cloudfront-distribution }}
+        run: |
+          echo "Creating CloudFront invalidation..."
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${DISTRIBUTION_ID}" \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          
+          echo "Invalidation ID: ${INVALIDATION_ID}"
+          echo "::notice title=CloudFront::Cache invalidation created: ${INVALIDATION_ID}"
+
+      # Smoke Tests
+      - name: Run smoke tests
+        if: inputs.run-smoke-tests
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          echo "::group::Smoke Tests"
+          ${{ inputs.smoke-test-command }}
+          echo "::endgroup::"
+          echo "✅ Smoke tests passed"
+
+      # Final Status
+      - name: Set deployment status
+        id: deployment-status
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+          echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          
+          if [ "${STATUS}" = "success" ]; then
+            echo "::notice title=Deployment Success::✅ Deployed to ${{ inputs.environment }} at ${TIMESTAMP}"
+          else
+            echo "::error title=Deployment Failed::❌ Deployment to ${{ inputs.environment }} failed"
+          fi
+
+      - name: Send Slack notification
+        if: always() && secrets.slack-webhook != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.slack-webhook }}
+          STATUS: ${{ steps.deployment-status.outputs.status }}
+          IMAGE_TAG: ${{ steps.build-info.outputs.tag }}
+        run: |
+          if [ "${STATUS}" = "success" ]; then
+            COLOR="good"
+            EMOJI="✅"
+          else
+            COLOR="danger"
+            EMOJI="❌"
+          fi
+          
+          curl -X POST "${SLACK_WEBHOOK}" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"${COLOR}\",
+                \"title\": \"${EMOJI} Deployment to ${{ inputs.environment }}\",
+                \"fields\": [
+                  {\"title\": \"Status\", \"value\": \"${STATUS}\", \"short\": true},
+                  {\"title\": \"Environment\", \"value\": \"${{ inputs.environment }}\", \"short\": true},
+                  {\"title\": \"Tag\", \"value\": \"${IMAGE_TAG}\", \"short\": true},
+                  {\"title\": \"Region\", \"value\": \"${{ inputs.aws-region }}\", \"short\": true}
+                ],
+                \"footer\": \"GitHub Actions\",
+                \"footer_icon\": \"https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png\"
+              }]
+            }"
